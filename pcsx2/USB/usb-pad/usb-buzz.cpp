@@ -13,6 +13,8 @@
 #include "USB/usb-pad/usb-pad.h"
 #include <common/Console.h>
 
+#include <SDL3/SDL.h>
+
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -129,6 +131,16 @@ namespace usb_pad
 
 	BuzzState::~BuzzState()
 	{
+		if (led_hid)
+		{
+			// Do not leave the real buzzers lit after the game is closed.
+			leds_known = true;
+			std::memset(leds, 0, sizeof(leds));
+			SendLedsHid();
+		}
+		CloseLedHid();
+		if (led_hid_inited)
+			SDL_hid_exit();
 #ifndef _WIN32
 		if (led_socket >= 0)
 			close(led_socket);
@@ -146,7 +158,86 @@ namespace usb_pad
 		}
 		leds_known = true;
 		if (changed)
+		{
 			SendLeds();
+			SendLedsHid();
+		}
+	}
+
+	// Real Buzz! hardware: wired controllers and the wireless USB dongle.
+	static constexpr u16 BUZZ_HID_VID = 0x054C;
+	static constexpr u16 BUZZ_HID_PID_WIRED = 0x0002;
+	static constexpr u16 BUZZ_HID_PID_WIRELESS = 0x1000;
+
+	// Opens the real buzzers for this USB port: port 1 gets the first set found, port 2 the second.
+	// Retried at most every 2 seconds, so buzzers plugged in later are picked up on the next light change.
+	bool BuzzState::OpenLedHid()
+	{
+		if (led_hid)
+			return true;
+
+		const auto now = std::chrono::steady_clock::now();
+		if (led_hid_last_try != std::chrono::steady_clock::time_point{} &&
+			now - led_hid_last_try < std::chrono::seconds(2))
+			return false;
+		led_hid_last_try = now;
+
+		if (!led_hid_inited)
+		{
+			if (SDL_hid_init() != 0)
+			{
+				Console.Error("(BuzzDevice) SDL_hid_init() failed: %s", SDL_GetError());
+				led_hid_enabled = false;
+				return false;
+			}
+			led_hid_inited = true;
+		}
+
+		SDL_hid_device_info* list = SDL_hid_enumerate(BUZZ_HID_VID, 0);
+		u32 index = 0;
+		for (SDL_hid_device_info* info = list; info; info = info->next)
+		{
+			if (info->product_id != BUZZ_HID_PID_WIRED && info->product_id != BUZZ_HID_PID_WIRELESS)
+				continue;
+			if (index++ != port)
+				continue;
+
+			led_hid = SDL_hid_open_path(info->path);
+			if (led_hid)
+				Console.WriteLn("(BuzzDevice) Port %u: driving the lights of real buzzers (PID %04X)", port + 1, info->product_id);
+			else
+				Console.Warning("(BuzzDevice) Port %u: found real buzzers but could not open them: %s", port + 1, SDL_GetError());
+			break;
+		}
+		SDL_hid_free_enumeration(list);
+		return led_hid != nullptr;
+	}
+
+	void BuzzState::CloseLedHid()
+	{
+		if (led_hid)
+		{
+			SDL_hid_close(led_hid);
+			led_hid = nullptr;
+		}
+	}
+
+	// Sends the lights to the real buzzers. Same layout as the game's report, after HID report ID 0:
+	// [0x00 (report ID), 0x00, L1, L2, L3, L4, 0x00, 0x00].
+	void BuzzState::SendLedsHid()
+	{
+		if (!led_hid_enabled || !leds_known || !OpenLedHid())
+			return;
+
+		const u8 report[8] = {0x00, 0x00,
+			static_cast<u8>(leds[0] ? 0xFF : 0x00), static_cast<u8>(leds[1] ? 0xFF : 0x00),
+			static_cast<u8>(leds[2] ? 0xFF : 0x00), static_cast<u8>(leds[3] ? 0xFF : 0x00),
+			0x00, 0x00};
+		if (SDL_hid_write(led_hid, report, sizeof(report)) < 0)
+		{
+			Console.Warning("(BuzzDevice) Port %u: lost the real buzzers, will look for them again: %s", port + 1, SDL_GetError());
+			CloseLedHid();
+		}
 	}
 
 	// Sends "buzzled 1 L1 L2 L3 L4" to 127.0.0.1:led_port. Only ever local.
@@ -284,6 +375,10 @@ namespace usb_pad
 	{
 		BuzzState* s = new BuzzState(port);
 
+		s->led_hid_enabled = USB::GetConfigBool(si, port, TypeName(), "LedHid", true);
+		if (s->led_hid_enabled && !s->OpenLedHid())
+			Console.WriteLn("(BuzzDevice) Port %u: no real buzzers found yet, lights are emulated only", port + 1);
+
 		const s32 led_port = USB::GetConfigInt(si, port, TypeName(), "LedUdpPort", 0);
 #ifndef _WIN32
 		if (led_port > 0 && led_port <= 65535)
@@ -416,6 +511,9 @@ namespace usb_pad
 	std::span<const SettingInfo> BuzzDevice::Settings(u32 subtype) const
 	{
 		static constexpr const SettingInfo info[] = {
+			{SettingInfo::Type::Boolean, "LedHid", TRANSLATE_NOOP("USB", "Light Real Buzzers"),
+				TRANSLATE_NOOP("USB", "Turns on the lights of real Buzz! buzzers (wired, or the wireless dongle) when the game does. Port 1 uses the first set found, port 2 the second."),
+				"true"},
 			{SettingInfo::Type::Integer, "LedUdpPort", TRANSLATE_NOOP("USB", "Light Output Port"),
 				TRANSLATE_NOOP("USB", "Sends the buzzer lights to this UDP port on 127.0.0.1 (0 = off)."),
 				"0", "0", "65535", "1", "%d", nullptr, nullptr, 1.0f},

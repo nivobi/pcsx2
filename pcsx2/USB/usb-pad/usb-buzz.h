@@ -8,6 +8,8 @@
 #include <list>
 #include <string>
 
+struct SDL_hid_device;
+
 namespace usb_pad
 {
 	enum BuzzControlID
@@ -53,9 +55,17 @@ namespace usb_pad
 		int led_socket = -1;
 		u16 led_port = 0;
 		std::chrono::steady_clock::time_point led_last_send{};
+		// Optional output of the lights to real Buzz! buzzers over HID ("BuzzDevice_LedHid").
+		bool led_hid_enabled = false;
+		bool led_hid_inited = false;
+		SDL_hid_device* led_hid = nullptr;
+		std::chrono::steady_clock::time_point led_hid_last_try{};
 
 		void SetLeds(const u8* values);
 		void SendLeds();
+		void SendLedsHid();
+		bool OpenLedHid();
+		void CloseLedHid();
 
 		#pragma pack(push, 1)
 		struct
