@@ -4,6 +4,7 @@
 #pragma once
 #include "SaveState.h"
 #include "USB/qemu-usb/desc.h"
+#include <chrono>
 #include <list>
 #include <string>
 
@@ -44,6 +45,17 @@ namespace usb_pad
 		USBDescDevice desc_dev{};
 
 		u32 port = 0;
+
+		// Buzzer lights as last set by the game (one byte per handset, non-zero = on).
+		u8 leds[4] = {};
+		bool leds_known = false;
+		// Optional local UDP output of the lights ("BuzzDevice_LedUdpPort"; 0 = off).
+		int led_socket = -1;
+		u16 led_port = 0;
+		std::chrono::steady_clock::time_point led_last_send{};
+
+		void SetLeds(const u8* values);
+		void SendLeds();
 
 		#pragma pack(push, 1)
 		struct

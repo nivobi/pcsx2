@@ -13,6 +13,13 @@
 #include "USB/usb-pad/usb-pad.h"
 #include <common/Console.h>
 
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 namespace usb_pad
 {
 	static const USBDescStrings desc_strings = {
@@ -120,7 +127,44 @@ namespace usb_pad
 	{
 	}
 
-	BuzzState::~BuzzState() = default;
+	BuzzState::~BuzzState()
+	{
+#ifndef _WIN32
+		if (led_socket >= 0)
+			close(led_socket);
+#endif
+	}
+
+	void BuzzState::SetLeds(const u8* values)
+	{
+		bool changed = !leds_known;
+		for (int i = 0; i < 4; i++)
+		{
+			const u8 on = values[i] ? 1 : 0;
+			changed |= leds[i] != on;
+			leds[i] = on;
+		}
+		leds_known = true;
+		if (changed)
+			SendLeds();
+	}
+
+	// Sends "buzzled 1 L1 L2 L3 L4" to 127.0.0.1:led_port. Only ever local.
+	void BuzzState::SendLeds()
+	{
+		led_last_send = std::chrono::steady_clock::now();
+#ifndef _WIN32
+		if (led_socket < 0 || !leds_known)
+			return;
+		char msg[32];
+		const int len = std::snprintf(msg, sizeof(msg), "buzzled 1 %d %d %d %d", leds[0], leds[1], leds[2], leds[3]);
+		sockaddr_in addr = {};
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(led_port);
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		sendto(led_socket, msg, len, 0, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+#endif
+	}
 
 	static void buzz_handle_control(USBDevice* dev, USBPacket* p,
 		int request, int value, int index, int length, uint8_t* data)
@@ -141,6 +185,14 @@ namespace usb_pad
 				break;
 			case SET_IDLE:
 				break;
+			case SET_REPORT:
+			{
+				// The game sets the buzzer lights: [0x00, L1, L2, L3, L4, 0x00, 0x00].
+				BuzzState* s = USB_CONTAINER_OF(dev, BuzzState, dev);
+				if (length >= 5)
+					s->SetLeds(data + 1);
+				break;
+			}
 			default:
 				ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
 				if (ret >= 0)
@@ -160,6 +212,11 @@ namespace usb_pad
 		{
 			goto fail;
 		}
+
+		// Resend the lights about once a second so a late listener catches up.
+		if (s->led_socket >= 0 && s->leds_known &&
+			std::chrono::steady_clock::now() - s->led_last_send >= std::chrono::seconds(1))
+			s->SendLeds();
 
 		switch (p->pid)
 		{
@@ -182,7 +239,14 @@ namespace usb_pad
 				}
 				break;
 			case USB_TOKEN_OUT:
+			{
+				u8 buf[8] = {};
+				const size_t n = std::min<size_t>(p->buffer_size, sizeof(buf));
+				std::memcpy(buf, p->buffer_ptr, n);
+				if (n >= 5)
+					s->SetLeds(buf + 1);
 				break;
+			}
 			default:
 			fail:
 				p->status = USB_RET_STALL;
@@ -219,6 +283,17 @@ namespace usb_pad
 	USBDevice* BuzzDevice::CreateDevice(SettingsInterface& si, u32 port, u32 subtype) const
 	{
 		BuzzState* s = new BuzzState(port);
+
+		const s32 led_port = USB::GetConfigInt(si, port, TypeName(), "LedUdpPort", 0);
+#ifndef _WIN32
+		if (led_port > 0 && led_port <= 65535)
+		{
+			s->led_port = static_cast<u16>(led_port);
+			s->led_socket = socket(AF_INET, SOCK_DGRAM, 0);
+			if (s->led_socket >= 0)
+				Console.WriteLn("(BuzzDevice) Sending buzzer lights to 127.0.0.1:%d", led_port);
+		}
+#endif
 
 		s->desc.full = &s->desc_dev;
 		s->desc.str = desc_strings;
@@ -340,6 +415,11 @@ namespace usb_pad
 
 	std::span<const SettingInfo> BuzzDevice::Settings(u32 subtype) const
 	{
-		return {};
+		static constexpr const SettingInfo info[] = {
+			{SettingInfo::Type::Integer, "LedUdpPort", TRANSLATE_NOOP("USB", "Light Output Port"),
+				TRANSLATE_NOOP("USB", "Sends the buzzer lights to this UDP port on 127.0.0.1 (0 = off)."),
+				"0", "0", "65535", "1", "%d", nullptr, nullptr, 1.0f},
+		};
+		return info;
 	}
 } // namespace usb_pad
